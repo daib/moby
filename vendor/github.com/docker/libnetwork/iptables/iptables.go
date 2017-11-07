@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // Action signifies the iptable action.
@@ -151,11 +151,11 @@ func ProgramChain(c *ChainInfo, bridgeName string, hairpinMode, enable bool) err
 			"-j", c.Name}
 		if !Exists(Nat, "PREROUTING", preroute...) && enable {
 			if err := c.Prerouting(Append, preroute...); err != nil {
-				return fmt.Errorf("Failed to inject docker in PREROUTING chain: %s", err)
+				return fmt.Errorf("Failed to inject %s in PREROUTING chain: %s", c.Name, err)
 			}
 		} else if Exists(Nat, "PREROUTING", preroute...) && !enable {
 			if err := c.Prerouting(Delete, preroute...); err != nil {
-				return fmt.Errorf("Failed to remove docker in PREROUTING chain: %s", err)
+				return fmt.Errorf("Failed to remove %s in PREROUTING chain: %s", c.Name, err)
 			}
 		}
 		output := []string{
@@ -167,11 +167,11 @@ func ProgramChain(c *ChainInfo, bridgeName string, hairpinMode, enable bool) err
 		}
 		if !Exists(Nat, "OUTPUT", output...) && enable {
 			if err := c.Output(Append, output...); err != nil {
-				return fmt.Errorf("Failed to inject docker in OUTPUT chain: %s", err)
+				return fmt.Errorf("Failed to inject %s in OUTPUT chain: %s", c.Name, err)
 			}
 		} else if Exists(Nat, "OUTPUT", output...) && !enable {
 			if err := c.Output(Delete, output...); err != nil {
-				return fmt.Errorf("Failed to inject docker in OUTPUT chain: %s", err)
+				return fmt.Errorf("Failed to inject %s in OUTPUT chain: %s", c.Name, err)
 			}
 		}
 	case Filter:
@@ -276,11 +276,7 @@ func (c *ChainInfo) Forward(action Action, ip net.IP, port int, proto, destAddr 
 		"--dport", strconv.Itoa(destPort),
 		"-j", "MASQUERADE",
 	}
-	if err := ProgramRule(Nat, "POSTROUTING", action, args); err != nil {
-		return err
-	}
-
-	return nil
+	return ProgramRule(Nat, "POSTROUTING", action, args)
 }
 
 // Link adds reciprocal ACCEPT rule for two supplied IP addresses.
@@ -301,10 +297,7 @@ func (c *ChainInfo) Link(action Action, ip1, ip2 net.IP, port int, proto string,
 	// reverse
 	args[7], args[9] = args[9], args[7]
 	args[10] = "--sport"
-	if err := ProgramRule(Filter, c.Name, action, args); err != nil {
-		return err
-	}
-	return nil
+	return ProgramRule(Filter, c.Name, action, args)
 }
 
 // ProgramRule adds the rule specified by args only if the
@@ -463,7 +456,7 @@ func RawCombinedOutputNative(args ...string) error {
 
 // ExistChain checks if a chain exists
 func ExistChain(chain string, table Table) bool {
-	if _, err := Raw("-t", string(table), "-L", chain); err == nil {
+	if _, err := Raw("-t", string(table), "-nL", chain); err == nil {
 		return true
 	}
 	return false

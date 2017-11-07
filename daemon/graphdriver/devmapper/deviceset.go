@@ -16,20 +16,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/pkg/devicemapper"
+	"github.com/docker/docker/pkg/dmesg"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/loopback"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/docker/pkg/parsers/kernel"
 	units "github.com/docker/go-units"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -534,11 +535,11 @@ func (devices *DeviceSet) activateDeviceIfNeeded(info *devInfo, ignoreDeleted bo
 	return devicemapper.ActivateDevice(devices.getPoolDevName(), info.Name(), info.DeviceID, info.Size)
 }
 
-// Return true only if kernel supports xfs and mkfs.xfs is available
-func xfsSupported() bool {
+// xfsSupported checks if xfs is supported, returns nil if it is, otherwise an error
+func xfsSupported() error {
 	// Make sure mkfs.xfs is available
 	if _, err := exec.LookPath("mkfs.xfs"); err != nil {
-		return false
+		return err // error text is descriptive enough
 	}
 
 	// Check if kernel supports xfs filesystem or not.
@@ -546,40 +547,47 @@ func xfsSupported() bool {
 
 	f, err := os.Open("/proc/filesystems")
 	if err != nil {
-		logrus.Warnf("devmapper: Could not check if xfs is supported: %v", err)
-		return false
+		return errors.Wrapf(err, "error checking for xfs support")
 	}
 	defer f.Close()
 
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if strings.HasSuffix(s.Text(), "\txfs") {
-			return true
+			return nil
 		}
 	}
 
 	if err := s.Err(); err != nil {
-		logrus.Warnf("devmapper: Could not check if xfs is supported: %v", err)
+		return errors.Wrapf(err, "error checking for xfs support")
 	}
-	return false
+
+	return errors.New(`kernel does not support xfs, or "modprobe xfs" failed`)
 }
 
 func determineDefaultFS() string {
-	if xfsSupported() {
+	err := xfsSupported()
+	if err == nil {
 		return "xfs"
 	}
 
-	logrus.Warn("devmapper: XFS is not supported in your system. Either the kernel doesn't support it or mkfs.xfs is not in your PATH. Defaulting to ext4 filesystem")
+	logrus.Warnf("devmapper: XFS is not supported in your system (%v). Defaulting to ext4 filesystem", err)
 	return "ext4"
+}
+
+// mkfsOptions tries to figure out whether some additional mkfs options are required
+func mkfsOptions(fs string) []string {
+	if fs == "xfs" && !kernel.CheckKernelVersion(3, 16, 0) {
+		// For kernels earlier than 3.16 (and newer xfsutils),
+		// some xfs features need to be explicitly disabled.
+		return []string{"-m", "crc=0,finobt=0"}
+	}
+
+	return []string{}
 }
 
 func (devices *DeviceSet) createFilesystem(info *devInfo) (err error) {
 	devname := info.DevName()
-
-	args := []string{}
-	args = append(args, devices.mkfsArgs...)
-
-	args = append(args, devname)
 
 	if devices.filesystem == "" {
 		devices.filesystem = determineDefaultFS()
@@ -588,7 +596,11 @@ func (devices *DeviceSet) createFilesystem(info *devInfo) (err error) {
 		return err
 	}
 
-	logrus.Infof("devmapper: Creating filesystem %s on device %s", devices.filesystem, info.Name())
+	args := mkfsOptions(devices.filesystem)
+	args = append(args, devices.mkfsArgs...)
+	args = append(args, devname)
+
+	logrus.Infof("devmapper: Creating filesystem %s on device %s, mkfs args: %v", devices.filesystem, info.Name(), args)
 	defer func() {
 		if err != nil {
 			logrus.Infof("devmapper: Error while creating filesystem %s on device %s: %v", devices.filesystem, info.Name(), err)
@@ -1189,7 +1201,7 @@ func (devices *DeviceSet) growFS(info *devInfo) error {
 	options = joinMountOptions(options, devices.mountOptions)
 
 	if err := mount.Mount(info.DevName(), fsMountPoint, devices.BaseDeviceFilesystem, options); err != nil {
-		return fmt.Errorf("Error mounting '%s' on '%s': %s", info.DevName(), fsMountPoint, err)
+		return fmt.Errorf("Error mounting '%s' on '%s': %s\n%v", info.DevName(), fsMountPoint, err, string(dmesg.Dmesg(256)))
 	}
 
 	defer unix.Unmount(fsMountPoint, unix.MNT_DETACH)
@@ -1255,14 +1267,13 @@ func (devices *DeviceSet) setupBaseImage() error {
 }
 
 func setCloseOnExec(name string) {
-	if fileInfos, _ := ioutil.ReadDir("/proc/self/fd"); fileInfos != nil {
-		for _, i := range fileInfos {
-			link, _ := os.Readlink(filepath.Join("/proc/self/fd", i.Name()))
-			if link == name {
-				fd, err := strconv.Atoi(i.Name())
-				if err == nil {
-					unix.CloseOnExec(fd)
-				}
+	fileInfos, _ := ioutil.ReadDir("/proc/self/fd")
+	for _, i := range fileInfos {
+		link, _ := os.Readlink(filepath.Join("/proc/self/fd", i.Name()))
+		if link == name {
+			fd, err := strconv.Atoi(i.Name())
+			if err == nil {
+				unix.CloseOnExec(fd)
 			}
 		}
 	}
@@ -1480,12 +1491,9 @@ func (devices *DeviceSet) closeTransaction() error {
 }
 
 func determineDriverCapabilities(version string) error {
-	/*
-	 * Driver version 4.27.0 and greater support deferred activation
-	 * feature.
-	 */
+	// Kernel driver version >= 4.27.0 support deferred removal
 
-	logrus.Debugf("devicemapper: driver version is %s", version)
+	logrus.Debugf("devicemapper: kernel dm driver version is %s", version)
 
 	versionSplit := strings.Split(version, ".")
 	major, err := strconv.Atoi(versionSplit[0])
@@ -1521,12 +1529,13 @@ func determineDriverCapabilities(version string) error {
 
 // Determine the major and minor number of loopback device
 func getDeviceMajorMinor(file *os.File) (uint64, uint64, error) {
-	stat, err := file.Stat()
+	var stat unix.Stat_t
+	err := unix.Stat(file.Name(), &stat)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	dev := stat.Sys().(*syscall.Stat_t).Rdev
+	dev := stat.Rdev
 	majorNum := major(dev)
 	minorNum := minor(dev)
 
@@ -1725,18 +1734,17 @@ func (devices *DeviceSet) initDevmapper(doInit bool) (retErr error) {
 	}
 
 	// Set the device prefix from the device id and inode of the docker root dir
-	st, err := os.Stat(devices.root)
-	if err != nil {
+	var st unix.Stat_t
+	if err := unix.Stat(devices.root, &st); err != nil {
 		return fmt.Errorf("devmapper: Error looking up dir %s: %s", devices.root, err)
 	}
-	sysSt := st.Sys().(*syscall.Stat_t)
 	// "reg-" stands for "regular file".
 	// In the future we might use "dev-" for "device file", etc.
 	// docker-maj,min[-inode] stands for:
 	//	- Managed by docker
 	//	- The target of this device is at major <maj> and minor <min>
 	//	- If <inode> is defined, use that file inside the device as a loopback image. Otherwise use the device itself.
-	devices.devicePrefix = fmt.Sprintf("docker-%d:%d-%d", major(sysSt.Dev), minor(sysSt.Dev), sysSt.Ino)
+	devices.devicePrefix = fmt.Sprintf("docker-%d:%d-%d", major(st.Dev), minor(st.Dev), st.Ino)
 	logrus.Debugf("devmapper: Generated prefix: %s", devices.devicePrefix)
 
 	// Check for the existence of the thin-pool device
@@ -1864,7 +1872,7 @@ func (devices *DeviceSet) initDevmapper(doInit bool) (retErr error) {
 
 	if devices.thinPoolDevice == "" {
 		if devices.metadataLoopFile != "" || devices.dataLoopFile != "" {
-			logrus.Warn("devmapper: Usage of loopback devices is strongly discouraged for production use. Please use `--storage-opt dm.thinpooldev` or use `man docker` to refer to dm.thinpooldev section.")
+			logrus.Warn("devmapper: Usage of loopback devices is strongly discouraged for production use. Please use `--storage-opt dm.thinpooldev` or use `man dockerd` to refer to dm.thinpooldev section.")
 		}
 	}
 
@@ -2384,7 +2392,7 @@ func (devices *DeviceSet) MountDevice(hash, path, mountLabel string) error {
 	options = joinMountOptions(options, label.FormatMountLabel("", mountLabel))
 
 	if err := mount.Mount(info.DevName(), path, fstype, options); err != nil {
-		return fmt.Errorf("devmapper: Error mounting '%s' on '%s': %s", info.DevName(), path, err)
+		return fmt.Errorf("devmapper: Error mounting '%s' on '%s': %s\n%v", info.DevName(), path, err, string(dmesg.Dmesg(256)))
 	}
 
 	if fstype == "xfs" && devices.xfsNospaceRetries != "" {
@@ -2668,7 +2676,7 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 			devices.metaDataLoopbackSize = size
 		case "dm.fs":
 			if val != "ext4" && val != "xfs" {
-				return nil, fmt.Errorf("devmapper: Unsupported filesystem %s\n", val)
+				return nil, fmt.Errorf("devmapper: Unsupported filesystem %s", val)
 			}
 			devices.filesystem = val
 		case "dm.mkfsarg":
@@ -2790,7 +2798,7 @@ func NewDeviceSet(root string, doInit bool, options []string, uidMaps, gidMaps [
 				Level: int(level),
 			})
 		default:
-			return nil, fmt.Errorf("devmapper: Unknown option %s\n", key)
+			return nil, fmt.Errorf("devmapper: Unknown option %s", key)
 		}
 	}
 

@@ -35,6 +35,7 @@ type Raft interface {
 type Config struct {
 	HeartbeatInterval time.Duration
 	SendTimeout       time.Duration
+	LargeSendTimeout  time.Duration
 	Credentials       credentials.TransportCredentials
 	RaftID            string
 
@@ -235,10 +236,7 @@ func (t *Transport) UpdatePeerAddr(id uint64, addr string) error {
 	if !ok {
 		return ErrIsNotFound
 	}
-	if err := p.updateAddr(addr); err != nil {
-		return err
-	}
-	return nil
+	return p.updateAddr(addr)
 }
 
 // PeerConn returns raw grpc connection to peer.

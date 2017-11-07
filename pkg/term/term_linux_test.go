@@ -3,29 +3,20 @@
 package term
 
 import (
-	"flag"
 	"io/ioutil"
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-var rootEnabled bool
-
-func init() {
-	flag.BoolVar(&rootEnabled, "test.root", false, "enable tests that require root")
-}
 
 // RequiresRoot skips tests that require root, unless the test.root flag has
 // been set
 func RequiresRoot(t *testing.T) {
-	if !rootEnabled {
+	if os.Getuid() != 0 {
 		t.Skip("skipping test that requires root")
 		return
 	}
-	assert.Equal(t, 0, os.Getuid(), "This test must be run as root.")
 }
 
 func newTtyForTest(t *testing.T) (*os.File, error) {
@@ -77,6 +68,7 @@ func TestGetFdInfo(t *testing.T) {
 	require.Equal(t, inFd, tty.Fd())
 	require.Equal(t, isTerminal, true)
 	tmpFile, err := newTempFile()
+	require.NoError(t, err)
 	defer tmpFile.Close()
 	inFd, isTerminal = GetFdInfo(tmpFile)
 	require.Equal(t, inFd, tmpFile.Fd())
@@ -90,6 +82,7 @@ func TestIsTerminal(t *testing.T) {
 	isTerminal := IsTerminal(tty.Fd())
 	require.Equal(t, isTerminal, true)
 	tmpFile, err := newTempFile()
+	require.NoError(t, err)
 	defer tmpFile.Close()
 	isTerminal = IsTerminal(tmpFile.Fd())
 	require.Equal(t, isTerminal, false)
@@ -103,6 +96,7 @@ func TestSaveState(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, state)
 	tty, err = newTtyForTest(t)
+	require.NoError(t, err)
 	defer tty.Close()
 	err = RestoreTerminal(tty.Fd(), state)
 	require.NoError(t, err)
@@ -113,6 +107,7 @@ func TestDisableEcho(t *testing.T) {
 	defer tty.Close()
 	require.NoError(t, err)
 	state, err := SetRawTerminal(tty.Fd())
+	defer RestoreTerminal(tty.Fd(), state)
 	require.NoError(t, err)
 	require.NotNil(t, state)
 	err = DisableEcho(tty.Fd(), state)

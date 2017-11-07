@@ -4,17 +4,18 @@ import (
 	"io"
 	"runtime"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/registry"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -25,8 +26,9 @@ type releaseableLayer struct {
 	rwLayer    layer.RWLayer
 }
 
-func (rl *releaseableLayer) Mount() (string, error) {
+func (rl *releaseableLayer) Mount() (containerfs.ContainerFS, error) {
 	var err error
+	var mountPath containerfs.ContainerFS
 	var chainID layer.ChainID
 	if rl.roLayer != nil {
 		chainID = rl.roLayer.ChainID()
@@ -35,13 +37,25 @@ func (rl *releaseableLayer) Mount() (string, error) {
 	mountID := stringid.GenerateRandomID()
 	rl.rwLayer, err = rl.layerStore.CreateRWLayer(mountID, chainID, nil)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to create rwlayer")
+		return nil, errors.Wrap(err, "failed to create rwlayer")
 	}
 
-	return rl.rwLayer.Mount("")
+	mountPath, err = rl.rwLayer.Mount("")
+	if err != nil {
+		// Clean up the layer if we fail to mount it here.
+		metadata, err := rl.layerStore.ReleaseRWLayer(rl.rwLayer)
+		layer.LogReleaseMetadata(metadata)
+		if err != nil {
+			logrus.Errorf("Failed to release RWLayer: %s", err)
+		}
+		rl.rwLayer = nil
+		return nil, err
+	}
+
+	return mountPath, nil
 }
 
-func (rl *releaseableLayer) Commit(platform string) (builder.ReleaseableLayer, error) {
+func (rl *releaseableLayer) Commit(os string) (builder.ReleaseableLayer, error) {
 	var chainID layer.ChainID
 	if rl.roLayer != nil {
 		chainID = rl.roLayer.ChainID()
@@ -51,8 +65,9 @@ func (rl *releaseableLayer) Commit(platform string) (builder.ReleaseableLayer, e
 	if err != nil {
 		return nil, err
 	}
+	defer stream.Close()
 
-	newLayer, err := rl.layerStore.Register(stream, chainID, layer.Platform(platform))
+	newLayer, err := rl.layerStore.Register(stream, chainID, layer.OS(os))
 	if err != nil {
 		return nil, err
 	}
@@ -75,20 +90,32 @@ func (rl *releaseableLayer) Release() error {
 	if rl.released {
 		return nil
 	}
+	if err := rl.releaseRWLayer(); err != nil {
+		// Best effort attempt at releasing read-only layer before returning original error.
+		rl.releaseROLayer()
+		return err
+	}
+	if err := rl.releaseROLayer(); err != nil {
+		return err
+	}
 	rl.released = true
-	rl.releaseRWLayer()
-	return rl.releaseROLayer()
+	return nil
 }
 
 func (rl *releaseableLayer) releaseRWLayer() error {
 	if rl.rwLayer == nil {
 		return nil
 	}
+	if err := rl.rwLayer.Unmount(); err != nil {
+		logrus.Errorf("Failed to unmount RWLayer: %s", err)
+		return err
+	}
 	metadata, err := rl.layerStore.ReleaseRWLayer(rl.rwLayer)
 	layer.LogReleaseMetadata(metadata)
 	if err != nil {
 		logrus.Errorf("Failed to release RWLayer: %s", err)
 	}
+	rl.rwLayer = nil
 	return err
 }
 
@@ -98,6 +125,10 @@ func (rl *releaseableLayer) releaseROLayer() error {
 	}
 	metadata, err := rl.layerStore.Release(rl.roLayer)
 	layer.LogReleaseMetadata(metadata)
+	if err != nil {
+		logrus.Errorf("Failed to release ROLayer: %s", err)
+	}
+	rl.roLayer = nil
 	return err
 }
 
@@ -145,7 +176,7 @@ func (daemon *Daemon) pullForBuilder(ctx context.Context, name string, authConfi
 // leaking of layers.
 func (daemon *Daemon) GetImageAndReleasableLayer(ctx context.Context, refOrID string, opts backend.GetImageAndLayerOptions) (builder.Image, builder.ReleaseableLayer, error) {
 	if refOrID == "" {
-		layer, err := newReleasableLayerForImage(nil, daemon.stores[opts.Platform].layerStore)
+		layer, err := newReleasableLayerForImage(nil, daemon.stores[opts.OS].layerStore)
 		return nil, layer, err
 	}
 
@@ -156,16 +187,16 @@ func (daemon *Daemon) GetImageAndReleasableLayer(ctx context.Context, refOrID st
 		}
 		// TODO: shouldn't we error out if error is different from "not found" ?
 		if image != nil {
-			layer, err := newReleasableLayerForImage(image, daemon.stores[opts.Platform].layerStore)
+			layer, err := newReleasableLayerForImage(image, daemon.stores[opts.OS].layerStore)
 			return image, layer, err
 		}
 	}
 
-	image, err := daemon.pullForBuilder(ctx, refOrID, opts.AuthConfig, opts.Output, opts.Platform)
+	image, err := daemon.pullForBuilder(ctx, refOrID, opts.AuthConfig, opts.Output, opts.OS)
 	if err != nil {
 		return nil, nil, err
 	}
-	layer, err := newReleasableLayerForImage(image, daemon.stores[opts.Platform].layerStore)
+	layer, err := newReleasableLayerForImage(image, daemon.stores[opts.OS].layerStore)
 	return image, layer, err
 }
 

@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/caps"
@@ -20,15 +19,17 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/stringutils"
-	"github.com/docker/docker/pkg/symlink"
 	"github.com/docker/docker/volume"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/devices"
 	"github.com/opencontainers/runc/libcontainer/user"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
+// nolint: gosimple
 var (
 	deviceCgroupRuleRegex = regexp.MustCompile("^([acb]) ([0-9]+|\\*):([0-9]+|\\*) ([rwm]{1,3})$")
 )
@@ -73,7 +74,6 @@ func setResources(s *specs.Spec, r containertypes.Resources) error {
 			ThrottleReadIOPSDevice:  readIOpsDevice,
 			ThrottleWriteIOPSDevice: writeIOpsDevice,
 		},
-		DisableOOMKiller: r.OomKillDisable,
 		Pids: &specs.LinuxPids{
 			Limit: r.PidsLimit,
 		},
@@ -156,15 +156,15 @@ func setDevices(s *specs.Spec, c *container.Container) error {
 	return nil
 }
 
-func setRlimits(daemon *Daemon, s *specs.Spec, c *container.Container) error {
-	var rlimits []specs.LinuxRlimit
+func (daemon *Daemon) setRlimits(s *specs.Spec, c *container.Container) error {
+	var rlimits []specs.POSIXRlimit
 
 	// We want to leave the original HostConfig alone so make a copy here
 	hostConfig := *c.HostConfig
 	// Merge with the daemon defaults
 	daemon.mergeUlimits(&hostConfig)
 	for _, ul := range hostConfig.Ulimits {
-		rlimits = append(rlimits, specs.LinuxRlimit{
+		rlimits = append(rlimits, specs.POSIXRlimit{
 			Type: "RLIMIT_" + strings.ToUpper(ul.Name),
 			Soft: uint64(ul.Soft),
 			Hard: uint64(ul.Hard),
@@ -187,7 +187,7 @@ func setUser(s *specs.Spec, c *container.Container) error {
 }
 
 func readUserFile(c *container.Container, p string) (io.ReadCloser, error) {
-	fp, err := symlink.FollowSymlinkInScope(filepath.Join(c.BaseFS, p), c.BaseFS)
+	fp, err := c.GetResourcePath(p)
 	if err != nil {
 		return nil, err
 	}
@@ -301,10 +301,13 @@ func setNamespaces(daemon *Daemon, s *specs.Spec, c *container.Container) error 
 		}
 		setNamespace(s, ns)
 	}
+
 	// ipc
-	if c.HostConfig.IpcMode.IsContainer() {
+	ipcMode := c.HostConfig.IpcMode
+	switch {
+	case ipcMode.IsContainer():
 		ns := specs.LinuxNamespace{Type: "ipc"}
-		ic, err := daemon.getIpcContainer(c)
+		ic, err := daemon.getIpcContainer(ipcMode.Container())
 		if err != nil {
 			return err
 		}
@@ -316,12 +319,19 @@ func setNamespaces(daemon *Daemon, s *specs.Spec, c *container.Container) error 
 			nsUser.Path = fmt.Sprintf("/proc/%d/ns/user", ic.State.GetPID())
 			setNamespace(s, nsUser)
 		}
-	} else if c.HostConfig.IpcMode.IsHost() {
+	case ipcMode.IsHost():
 		oci.RemoveNamespace(s, specs.LinuxNamespaceType("ipc"))
-	} else {
+	case ipcMode.IsEmpty():
+		// A container was created by an older version of the daemon.
+		// The default behavior used to be what is now called "shareable".
+		fallthrough
+	case ipcMode.IsPrivate(), ipcMode.IsShareable(), ipcMode.IsNone():
 		ns := specs.LinuxNamespace{Type: "ipc"}
 		setNamespace(s, ns)
+	default:
+		return fmt.Errorf("Invalid IPC mode: %v", ipcMode)
 	}
+
 	// pid
 	if c.HostConfig.PidMode.IsContainer() {
 		ns := specs.LinuxNamespace{Type: "pid"}
@@ -428,7 +438,7 @@ func ensureShared(path string) error {
 	}
 
 	if !sharedMount {
-		return fmt.Errorf("Path %s is mounted on %s but it is not a shared mount.", path, sourceMount)
+		return fmt.Errorf("path %s is mounted on %s but it is not a shared mount", path, sourceMount)
 	}
 	return nil
 }
@@ -455,9 +465,41 @@ func ensureSharedOrSlave(path string) error {
 	}
 
 	if !sharedMount && !slaveMount {
-		return fmt.Errorf("Path %s is mounted on %s but it is not a shared or slave mount.", path, sourceMount)
+		return fmt.Errorf("path %s is mounted on %s but it is not a shared or slave mount", path, sourceMount)
 	}
 	return nil
+}
+
+// Get the set of mount flags that are set on the mount that contains the given
+// path and are locked by CL_UNPRIVILEGED. This is necessary to ensure that
+// bind-mounting "with options" will not fail with user namespaces, due to
+// kernel restrictions that require user namespace mounts to preserve
+// CL_UNPRIVILEGED locked flags.
+func getUnprivilegedMountFlags(path string) ([]string, error) {
+	var statfs unix.Statfs_t
+	if err := unix.Statfs(path, &statfs); err != nil {
+		return nil, err
+	}
+
+	// The set of keys come from https://github.com/torvalds/linux/blob/v4.13/fs/namespace.c#L1034-L1048.
+	unprivilegedFlags := map[uint64]string{
+		unix.MS_RDONLY:     "ro",
+		unix.MS_NODEV:      "nodev",
+		unix.MS_NOEXEC:     "noexec",
+		unix.MS_NOSUID:     "nosuid",
+		unix.MS_NOATIME:    "noatime",
+		unix.MS_RELATIME:   "relatime",
+		unix.MS_NODIRATIME: "nodiratime",
+	}
+
+	var flags []string
+	for mask, flag := range unprivilegedFlags {
+		if uint64(statfs.Flags)&mask == mask {
+			flags = append(flags, flag)
+		}
+	}
+
+	return flags, nil
 }
 
 var (
@@ -486,10 +528,17 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 		userMounts[m.Destination] = struct{}{}
 	}
 
+	// Filter out mounts from spec
+	noIpc := c.HostConfig.IpcMode.IsNone()
 	// Filter out mounts that are overridden by user supplied mounts
 	var defaultMounts []specs.Mount
 	_, mountDev := userMounts["/dev"]
 	for _, m := range s.Mounts {
+		// filter out /dev/shm mount if case IpcMode is none
+		if noIpc && m.Destination == "/dev/shm" {
+			continue
+		}
+		// filter out mount overridden by a user supplied mount
 		if _, ok := userMounts[m.Destination]; !ok {
 			if mountDev && strings.HasPrefix(m.Destination, "/dev/") {
 				continue
@@ -502,13 +551,14 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 	for _, m := range mounts {
 		for _, cm := range s.Mounts {
 			if cm.Destination == m.Destination {
-				return fmt.Errorf("Duplicate mount point '%s'", m.Destination)
+				return duplicateMountPointError(m.Destination)
 			}
 		}
 
 		if m.Source == "tmpfs" {
 			data := m.Data
-			options := []string{"noexec", "nosuid", "nodev", string(volume.DefaultPropagationMode)}
+			parser := volume.NewParser("linux")
+			options := []string{"noexec", "nosuid", "nodev", string(parser.DefaultPropagationMode())}
 			if data != "" {
 				options = append(options, strings.Split(data, ",")...)
 			}
@@ -558,6 +608,19 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 			opts = append(opts, mountPropagationReverseMap[pFlag])
 		}
 
+		// If we are using user namespaces, then we must make sure that we
+		// don't drop any of the CL_UNPRIVILEGED "locked" flags of the source
+		// "mount" when we bind-mount. The reason for this is that at the point
+		// when runc sets up the root filesystem, it is already inside a user
+		// namespace, and thus cannot change any flags that are locked.
+		if daemon.configStore.RemappedRoot != "" {
+			unprivOpts, err := getUnprivilegedMountFlags(m.Source)
+			if err != nil {
+				return err
+			}
+			opts = append(opts, unprivOpts...)
+		}
+
 		mt.Options = opts
 		s.Mounts = append(s.Mounts, mt)
 	}
@@ -589,6 +652,14 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 		s.Linux.MaskedPaths = nil
 	}
 
+	// Set size for /dev/shm mount that comes from spec (IpcMode: private only)
+	for i, m := range s.Mounts {
+		if m.Destination == "/dev/shm" {
+			sizeOpt := "size=" + strconv.FormatInt(c.HostConfig.ShmSize, 10)
+			s.Mounts[i].Options = append(s.Mounts[i].Options, sizeOpt)
+		}
+	}
+
 	// TODO: until a kernel/mount solution exists for handling remount in a user namespace,
 	// we must clear the readonly flag for the cgroups mount (@mrunalp concurs)
 	if uidMap := daemon.idMappings.UIDs(); uidMap != nil || c.HostConfig.Privileged {
@@ -607,8 +678,8 @@ func (daemon *Daemon) populateCommonSpec(s *specs.Spec, c *container.Container) 
 	if err != nil {
 		return err
 	}
-	s.Root = specs.Root{
-		Path:     c.BaseFS,
+	s.Root = &specs.Root{
+		Path:     c.BaseFS.Path(),
 		Readonly: c.HostConfig.ReadonlyRootfs,
 	}
 	if err := c.SetupWorkingDirectory(daemon.idMappings.RootPair()); err != nil {
@@ -684,7 +755,7 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 	if err := setResources(&s, c.HostConfig.Resources); err != nil {
 		return nil, fmt.Errorf("linux runtime spec resources: %v", err)
 	}
-	s.Linux.Resources.OOMScoreAdj = &c.HostConfig.OomScoreAdj
+	s.Process.OOMScoreAdj = &c.HostConfig.OomScoreAdj
 	s.Linux.Sysctl = c.HostConfig.Sysctls
 
 	p := s.Linux.CgroupsPath
@@ -693,11 +764,11 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 		if err != nil {
 			return nil, err
 		}
-		p, _ = cgroups.GetOwnCgroup("cpu")
+		_, err = cgroups.GetOwnCgroup("cpu")
 		if err != nil {
 			return nil, err
 		}
-		p = filepath.Join(initPath, p)
+		p = filepath.Join(initPath, s.Linux.CgroupsPath)
 	}
 
 	// Clean path to guard against things like ../../../BAD
@@ -712,7 +783,7 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 	if err := setDevices(&s, c); err != nil {
 		return nil, fmt.Errorf("linux runtime spec devices: %v", err)
 	}
-	if err := setRlimits(daemon, &s, c); err != nil {
+	if err := daemon.setRlimits(&s, c); err != nil {
 		return nil, fmt.Errorf("linux runtime spec rlimits: %v", err)
 	}
 	if err := setUser(&s, c); err != nil {
@@ -745,7 +816,9 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 		return nil, err
 	}
 
-	ms = append(ms, c.IpcMounts()...)
+	if !c.HostConfig.IpcMode.IsPrivate() && !c.HostConfig.IpcMode.IsEmpty() {
+		ms = append(ms, c.IpcMounts()...)
+	}
 
 	tmpfsMounts, err := c.TmpfsMounts()
 	if err != nil {
@@ -806,9 +879,10 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 	}
 	s.Process.SelinuxLabel = c.GetProcessLabel()
 	s.Process.NoNewPrivileges = c.NoNewPrivileges
+	s.Process.OOMScoreAdj = &c.HostConfig.OomScoreAdj
 	s.Linux.MountLabel = c.MountLabel
 
-	return (*specs.Spec)(&s), nil
+	return &s, nil
 }
 
 func clearReadOnly(m *specs.Mount) {

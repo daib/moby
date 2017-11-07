@@ -11,17 +11,19 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/transport"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/api/equality"
 	"github.com/docker/swarmkit/ca"
 	"github.com/docker/swarmkit/log"
+	"github.com/docker/swarmkit/manager/drivers"
 	"github.com/docker/swarmkit/manager/state/store"
+	"github.com/docker/swarmkit/protobuf/ptypes"
 	"github.com/docker/swarmkit/remotes"
 	"github.com/docker/swarmkit/watch"
 	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -125,6 +127,8 @@ type Dispatcher struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	clusterUpdateQueue   *watch.Queue
+	dp                   *drivers.DriverProvider
+	securityConfig       *ca.SecurityConfig
 
 	taskUpdates     map[string]*api.TaskStatus // indexed by task ID
 	taskUpdatesLock sync.Mutex
@@ -142,14 +146,16 @@ type Dispatcher struct {
 }
 
 // New returns Dispatcher with cluster interface(usually raft.Node).
-func New(cluster Cluster, c *Config) *Dispatcher {
+func New(cluster Cluster, c *Config, dp *drivers.DriverProvider, securityConfig *ca.SecurityConfig) *Dispatcher {
 	d := &Dispatcher{
+		dp:                    dp,
 		nodes:                 newNodeStore(c.HeartbeatPeriod, c.HeartbeatEpsilon, c.GracePeriodMultiplier, c.RateLimitPeriod),
 		downNodes:             newNodeStore(defaultNodeDownPeriod, 0, 1, 0),
 		store:                 cluster.MemoryStore(),
 		cluster:               cluster,
 		processUpdatesTrigger: make(chan struct{}, 1),
 		config:                c,
+		securityConfig:        securityConfig,
 	}
 
 	d.processUpdatesCond = sync.NewCond(&d.processUpdatesLock)
@@ -627,6 +633,8 @@ func (d *Dispatcher) processUpdates(ctx context.Context) {
 				}
 
 				task.Status = *status
+				task.Status.AppliedBy = d.securityConfig.ClientTLSCreds.NodeID()
+				task.Status.AppliedAt = ptypes.MustTimestampProto(time.Now())
 				if err := store.UpdateTask(tx, task); err != nil {
 					logger.WithError(err).Error("failed to update task status")
 					return nil
@@ -836,7 +844,7 @@ func (d *Dispatcher) Assignments(r *api.AssignmentsRequest, stream api.Dispatche
 	var (
 		sequence    int64
 		appliesTo   string
-		assignments = newAssignmentSet(log)
+		assignments = newAssignmentSet(log, d.dp)
 	)
 
 	sendMessage := func(msg api.AssignmentsMessage, assignmentType api.AssignmentsMessage_Type) error {
@@ -846,10 +854,7 @@ func (d *Dispatcher) Assignments(r *api.AssignmentsRequest, stream api.Dispatche
 		appliesTo = msg.ResultsIn
 		msg.Type = assignmentType
 
-		if err := stream.Send(&msg); err != nil {
-			return err
-		}
-		return nil
+		return stream.Send(&msg)
 	}
 
 	// TODO(aaronl): Also send node secrets that should be exposed to

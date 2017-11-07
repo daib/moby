@@ -5,8 +5,8 @@ import (
 
 	"github.com/docker/docker/builder/fscache"
 	"github.com/docker/docker/builder/remotecontext"
-	"github.com/docker/docker/client/session"
-	"github.com/docker/docker/client/session/filesync"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/filesync"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
@@ -41,7 +41,6 @@ func (cst *ClientSessionTransport) Copy(ctx context.Context, id fscache.RemoteId
 type ClientSessionSourceIdentifier struct {
 	includePatterns []string
 	caller          session.Caller
-	sharedKey       string
 	uuid            string
 }
 

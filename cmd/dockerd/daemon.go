@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
@@ -30,17 +29,16 @@ import (
 	"github.com/docker/docker/builder/dockerfile"
 	"github.com/docker/docker/builder/fscache"
 	"github.com/docker/docker/cli/debug"
-	"github.com/docker/docker/client/session"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/daemon/cluster"
 	"github.com/docker/docker/daemon/config"
+	"github.com/docker/docker/daemon/listeners"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/libcontainerd"
 	dopts "github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/authorization"
-	"github.com/docker/docker/pkg/jsonlog"
-	"github.com/docker/docker/pkg/listeners"
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/signal"
@@ -50,7 +48,9 @@ import (
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/go-connections/tlsconfig"
 	swarmapi "github.com/docker/swarmkit/api"
+	"github.com/moby/buildkit/session"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
 
@@ -94,9 +94,12 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	}
 
 	logrus.SetFormatter(&logrus.TextFormatter{
-		TimestampFormat: jsonlog.RFC3339NanoFixed,
+		TimestampFormat: jsonmessage.RFC3339NanoFixed,
 		DisableColors:   cli.Config.RawLogs,
+		FullTimestamp:   true,
 	})
+
+	system.InitLCOW(cli.Config.Experimental)
 
 	if err := setDefaultUmask(); err != nil {
 		return fmt.Errorf("Failed to set umask: %v", err)
@@ -131,7 +134,6 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		Logging:     true,
 		SocketGroup: cli.Config.SocketGroup,
 		Version:     dockerversion.Version,
-		EnableCors:  cli.Config.EnableCors,
 		CorsHeaders: cli.Config.CorsHeaders,
 	}
 
@@ -197,15 +199,23 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		cli.api.Accept(addr, ls...)
 	}
 
-	registryService := registry.NewService(cli.Config.ServiceOptions)
-	containerdRemote, err := libcontainerd.New(cli.getLibcontainerdRoot(), cli.getPlatformRemoteOptions()...)
+	registryService, err := registry.NewService(cli.Config.ServiceOptions)
+	if err != nil {
+		return err
+	}
+
+	rOpts, err := cli.getRemoteOptions()
+	if err != nil {
+		return fmt.Errorf("Failed to generate containerd options: %s", err)
+	}
+	containerdRemote, err := libcontainerd.New(filepath.Join(cli.Config.Root, "containerd"), filepath.Join(cli.Config.ExecRoot, "containerd"), rOpts...)
 	if err != nil {
 		return err
 	}
 	signal.Trap(func() {
 		cli.stop()
 		<-stopc // wait for daemonCli.start() to return
-	})
+	}, logrus.StandardLogger())
 
 	// Notify that the API is active, but before daemon is set up.
 	preNotifySystem()
@@ -214,10 +224,6 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	if err := cli.initMiddlewares(cli.api, serverConfig, pluginStore); err != nil {
 		logrus.Fatalf("Error creating middlewares: %v", err)
-	}
-
-	if system.LCOWSupported() {
-		logrus.Warnln("LCOW support is enabled - this feature is incomplete")
 	}
 
 	d, err := daemon.NewDaemon(cli.Config, registryService, containerdRemote, pluginStore)
@@ -383,10 +389,8 @@ func (cli *DaemonCli) reloadConfig() {
 			switch {
 			case debugEnabled && !config.Debug: // disable debug
 				debug.Disable()
-				cli.api.DisableProfiler()
 			case config.Debug && !debugEnabled: // enable debug
 				debug.Enable()
-				cli.api.EnableProfiler()
 			}
 
 		}
@@ -454,7 +458,7 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 		c, err := config.MergeDaemonConfigurations(conf, flags, opts.configFile)
 		if err != nil {
 			if flags.Changed("config-file") || !os.IsNotExist(err) {
-				return nil, fmt.Errorf("unable to configure the Docker daemon with file %s: %v\n", opts.configFile, err)
+				return nil, fmt.Errorf("unable to configure the Docker daemon with file %s: %v", opts.configFile, err)
 			}
 		}
 		// the merged configuration can be nil if the config file didn't exist.
@@ -468,7 +472,7 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 		return nil, err
 	}
 
-	if conf.V2Only == false {
+	if !conf.V2Only {
 		logrus.Warnf(`The "disable-legacy-registry" option is deprecated and wil be removed in Docker v17.12. Interacting with legacy (v1) registries will no longer be supported in Docker v17.12"`)
 	}
 
@@ -536,11 +540,11 @@ func initRouter(opts routerOptions) {
 		}
 	}
 
-	opts.api.InitRouter(debug.IsEnabled(), routers...)
+	opts.api.InitRouter(routers...)
 }
 
 // TODO: remove this from cli and return the authzMiddleware
-func (cli *DaemonCli) initMiddlewares(s *apiserver.Server, cfg *apiserver.Config, pluginStore *plugin.Store) error {
+func (cli *DaemonCli) initMiddlewares(s *apiserver.Server, cfg *apiserver.Config, pluginStore plugingetter.PluginGetter) error {
 	v := cfg.Version
 
 	exp := middleware.NewExperimentalMiddleware(cli.Config.Experimental)
@@ -549,7 +553,7 @@ func (cli *DaemonCli) initMiddlewares(s *apiserver.Server, cfg *apiserver.Config
 	vm := middleware.NewVersionMiddleware(v, api.DefaultVersion, api.MinVersion)
 	s.UseMiddleware(vm)
 
-	if cfg.EnableCors || cfg.CorsHeaders != "" {
+	if cfg.CorsHeaders != "" {
 		c := middleware.NewCORSMiddleware(cfg.CorsHeaders)
 		s.UseMiddleware(c)
 	}
@@ -558,6 +562,17 @@ func (cli *DaemonCli) initMiddlewares(s *apiserver.Server, cfg *apiserver.Config
 	cli.Config.AuthzMiddleware = cli.authzMiddleware
 	s.UseMiddleware(cli.authzMiddleware)
 	return nil
+}
+
+func (cli *DaemonCli) getRemoteOptions() ([]libcontainerd.RemoteOption, error) {
+	opts := []libcontainerd.RemoteOption{}
+
+	pOpts, err := cli.getPlatformRemoteOptions()
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, pOpts...)
+	return opts, nil
 }
 
 // validates that the plugins requested with the --authorization-plugin flag are valid AuthzDriver

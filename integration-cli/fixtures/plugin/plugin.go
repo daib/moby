@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/libcontainerd"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/plugin"
 	"github.com/docker/docker/registry"
@@ -18,7 +17,7 @@ import (
 	"golang.org/x/net/context"
 )
 
-// CreateOpt is is passed used to change the defualt plugin config before
+// CreateOpt is is passed used to change the default plugin config before
 // creating it
 type CreateOpt func(*Config)
 
@@ -64,14 +63,6 @@ func Create(ctx context.Context, c CreateClient, name string, opts ...CreateOpt)
 	return c.PluginCreate(ctx, tar, types.PluginCreateOptions{RepoName: name})
 }
 
-// TODO(@cpuguy83): we really shouldn't have to do this...
-// The manager panics on init when `Executor` is not set.
-type dummyExecutor struct{}
-
-func (dummyExecutor) Client(libcontainerd.Backend) (libcontainerd.Client, error) { return nil, nil }
-func (dummyExecutor) Cleanup()                                                   {}
-func (dummyExecutor) UpdateOptions(...libcontainerd.RemoteOption) error          { return nil }
-
 // CreateInRegistry makes a plugin (locally) and pushes it to a registry.
 // This does not use a dockerd instance to create or push the plugin.
 // If you just want to create a plugin in some daemon, use `Create`.
@@ -97,12 +88,21 @@ func CreateInRegistry(ctx context.Context, repo string, auth *types.AuthConfig, 
 	}
 	defer tar.Close()
 
+	dummyExec := func(m *plugin.Manager) (plugin.Executor, error) {
+		return nil, nil
+	}
+
+	regService, err := registry.NewService(registry.ServiceOptions{V2Only: true})
+	if err != nil {
+		return err
+	}
+
 	managerConfig := plugin.ManagerConfig{
 		Store:           plugin.NewStore(),
-		RegistryService: registry.NewService(registry.ServiceOptions{V2Only: true}),
+		RegistryService: regService,
 		Root:            filepath.Join(tmpDir, "root"),
 		ExecRoot:        "/run/docker", // manager init fails if not set
-		Executor:        dummyExecutor{},
+		CreateExecutor:  dummyExec,
 		LogPluginEvent:  func(id, name, action string) {}, // panics when not set
 	}
 	manager, err := plugin.NewManager(managerConfig)

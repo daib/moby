@@ -1,11 +1,11 @@
-// +build linux freebsd solaris
+// +build linux freebsd
 
 package daemon
 
 import (
 	"runtime"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 // getSize returns the real size & virtual size of the container.

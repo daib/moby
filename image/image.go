@@ -96,8 +96,8 @@ func (img *Image) RunConfig() *container.Config {
 	return img.Config
 }
 
-// Platform returns the image's operating system. If not populated, defaults to the host runtime OS.
-func (img *Image) Platform() string {
+// OperatingSystem returns the image's operating system. If not populated, defaults to the host runtime OS.
+func (img *Image) OperatingSystem() string {
 	os := img.OS
 	if os == "" {
 		os = runtime.GOOS
@@ -137,10 +137,13 @@ type ChildConfig struct {
 // NewChildImage creates a new Image as a child of this image.
 func NewChildImage(img *Image, child ChildConfig, platform string) *Image {
 	isEmptyLayer := layer.IsEmpty(child.DiffID)
-	rootFS := img.RootFS
-	if rootFS == nil {
+	var rootFS *RootFS
+	if img.RootFS != nil {
+		rootFS = img.RootFS.Clone()
+	} else {
 		rootFS = NewRootFS()
 	}
+
 	if !isEmptyLayer {
 		rootFS.Append(child.DiffID)
 	}

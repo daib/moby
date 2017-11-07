@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/api/equality"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/protobuf/ptypes"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -119,6 +119,7 @@ func Resolve(ctx context.Context, task *api.Task, executor Executor) (Controller
 		// we always want to proceed to accepted when we resolve the controller
 		status.Message = "accepted"
 		status.State = api.TaskStateAccepted
+		status.Err = ""
 	}
 
 	return ctlr, status, err
@@ -158,6 +159,7 @@ func Do(ctx context.Context, task *api.Task, ctlr Controller) (*api.TaskStatus, 
 		current := status.State
 		status.State = state
 		status.Message = msg
+		status.Err = ""
 
 		if current > state {
 			panic("invalid state transition")

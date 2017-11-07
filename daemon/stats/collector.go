@@ -1,14 +1,12 @@
-// +build !solaris
-
 package stats
 
 import (
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/pubsub"
+	"github.com/sirupsen/logrus"
 )
 
 // Collect registers the container with the collector and adds it to
@@ -113,10 +111,10 @@ func (s *Collector) Run() {
 
 type notRunningErr interface {
 	error
-	ContainerIsRunning() bool
+	Conflict()
 }
 
 type notFoundErr interface {
 	error
-	ContainerNotFound() bool
+	NotFound()
 }

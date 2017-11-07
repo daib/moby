@@ -1,13 +1,12 @@
 package daemon
 
 import (
-	"errors"
-	"fmt"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	dockercontainer "github.com/docker/docker/container"
 	"github.com/docker/libnetwork"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // ContainerRename changes the name of a container, using the oldName
@@ -20,7 +19,7 @@ func (daemon *Daemon) ContainerRename(oldName, newName string) error {
 	)
 
 	if oldName == "" || newName == "" {
-		return errors.New("Neither old nor new names may be empty")
+		return validationError{errors.New("Neither old nor new names may be empty")}
 	}
 
 	if newName[0] != '/' {
@@ -39,23 +38,23 @@ func (daemon *Daemon) ContainerRename(oldName, newName string) error {
 	oldIsAnonymousEndpoint := container.NetworkSettings.IsAnonymousEndpoint
 
 	if oldName == newName {
-		return errors.New("Renaming a container with the same name as its current name")
+		return validationError{errors.New("Renaming a container with the same name as its current name")}
 	}
 
 	links := map[string]*dockercontainer.Container{}
 	for k, v := range daemon.linkIndex.children(container) {
 		if !strings.HasPrefix(k, oldName) {
-			return fmt.Errorf("Linked container %s does not match parent %s", k, oldName)
+			return validationError{errors.Errorf("Linked container %s does not match parent %s", k, oldName)}
 		}
 		links[strings.TrimPrefix(k, oldName)] = v
 	}
 
 	if newName, err = daemon.reserveName(container.ID, newName); err != nil {
-		return fmt.Errorf("Error when allocating new name: %v", err)
+		return errors.Wrap(err, "Error when allocating new name")
 	}
 
 	for k, v := range links {
-		daemon.nameIndex.Reserve(newName+k, v.ID)
+		daemon.containersReplica.ReserveName(newName+k, v.ID)
 		daemon.linkIndex.link(container, v, newName+k)
 	}
 
@@ -68,10 +67,10 @@ func (daemon *Daemon) ContainerRename(oldName, newName string) error {
 			container.NetworkSettings.IsAnonymousEndpoint = oldIsAnonymousEndpoint
 			daemon.reserveName(container.ID, oldName)
 			for k, v := range links {
-				daemon.nameIndex.Reserve(oldName+k, v.ID)
+				daemon.containersReplica.ReserveName(oldName+k, v.ID)
 				daemon.linkIndex.link(container, v, oldName+k)
 				daemon.linkIndex.unlink(newName+k, v, container)
-				daemon.nameIndex.Release(newName + k)
+				daemon.containersReplica.ReleaseName(newName + k)
 			}
 			daemon.releaseName(newName)
 		}
@@ -79,7 +78,7 @@ func (daemon *Daemon) ContainerRename(oldName, newName string) error {
 
 	for k, v := range links {
 		daemon.linkIndex.unlink(oldName+k, v, container)
-		daemon.nameIndex.Release(oldName + k)
+		daemon.containersReplica.ReleaseName(oldName + k)
 	}
 	daemon.releaseName(oldName)
 	if err = container.CheckpointTo(daemon.containersReplica); err != nil {

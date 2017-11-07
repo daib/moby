@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
@@ -21,13 +20,13 @@ import (
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/cluster/convert"
 	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/libnetwork"
 	"github.com/docker/swarmkit/agent/exec"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
 	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/opencontainers/go-digest"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 )
@@ -41,8 +40,8 @@ type containerAdapter struct {
 	dependencies exec.DependencyGetter
 }
 
-func newContainerAdapter(b executorpkg.Backend, task *api.Task, dependencies exec.DependencyGetter) (*containerAdapter, error) {
-	ctnr, err := newContainerConfig(task)
+func newContainerAdapter(b executorpkg.Backend, task *api.Task, node *api.NodeDescription, dependencies exec.DependencyGetter) (*containerAdapter, error) {
+	ctnr, err := newContainerConfig(task, node)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +92,6 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 		// TODO @jhowardmsft LCOW Support: This will need revisiting as
 		// the stack is built up to include LCOW support for swarm.
 		platform := runtime.GOOS
-		if system.LCOWSupported() {
-			platform = "linux"
-		}
 		err := c.backend.PullImage(ctx, c.container.image(), "", platform, metaHeaders, authConfig, pw)
 		pw.CloseWithError(err)
 	}()
@@ -199,7 +195,7 @@ func (c *containerAdapter) networkAttach(ctx context.Context) error {
 		}
 	}
 
-	return c.backend.UpdateAttachment(networkName, networkID, c.container.id(), config)
+	return c.backend.UpdateAttachment(networkName, networkID, c.container.networkAttachmentContainerID(), config)
 }
 
 func (c *containerAdapter) waitForDetach(ctx context.Context) error {
@@ -218,7 +214,7 @@ func (c *containerAdapter) waitForDetach(ctx context.Context) error {
 		}
 	}
 
-	return c.backend.WaitForDetachment(ctx, networkName, networkID, c.container.taskID(), c.container.id())
+	return c.backend.WaitForDetachment(ctx, networkName, networkID, c.container.taskID(), c.container.networkAttachmentContainerID())
 }
 
 func (c *containerAdapter) create(ctx context.Context) error {
@@ -451,7 +447,7 @@ func (c *containerAdapter) logs(ctx context.Context, options api.LogSubscription
 			}
 		}
 	}
-	msgs, err := c.backend.ContainerLogs(ctx, c.container.name(), apiOptions)
+	msgs, _, err := c.backend.ContainerLogs(ctx, c.container.name(), apiOptions)
 	if err != nil {
 		return nil, err
 	}

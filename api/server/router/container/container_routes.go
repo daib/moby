@@ -8,8 +8,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/api"
+	"github.com/docker/docker/api/errdefs"
 	"github.com/docker/docker/api/server/httputils"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
@@ -19,6 +18,8 @@ import (
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/signal"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/net/websocket"
 )
@@ -27,7 +28,7 @@ func (s *containerRouter) getContainersJSON(ctx context.Context, w http.Response
 	if err := httputils.ParseForm(r); err != nil {
 		return err
 	}
-	filter, err := filters.FromParam(r.Form.Get("filters"))
+	filter, err := filters.FromJSON(r.Form.Get("filters"))
 	if err != nil {
 		return err
 	}
@@ -69,7 +70,7 @@ func (s *containerRouter) getContainersStats(ctx context.Context, w http.Respons
 	config := &backend.ContainerStatsConfig{
 		Stream:    stream,
 		OutStream: w,
-		Version:   string(httputils.VersionFromContext(ctx)),
+		Version:   httputils.VersionFromContext(ctx),
 	}
 
 	return s.backend.ContainerStats(ctx, vars["name"], config)
@@ -87,7 +88,7 @@ func (s *containerRouter) getContainersLogs(ctx context.Context, w http.Response
 	// with the appropriate status code.
 	stdout, stderr := httputils.BoolValue(r, "stdout"), httputils.BoolValue(r, "stderr")
 	if !(stdout || stderr) {
-		return fmt.Errorf("Bad parameters: you must choose at least one stream")
+		return validationError{errors.New("Bad parameters: you must choose at least one stream")}
 	}
 
 	containerName := vars["name"]
@@ -101,19 +102,7 @@ func (s *containerRouter) getContainersLogs(ctx context.Context, w http.Response
 		Details:    httputils.BoolValue(r, "details"),
 	}
 
-	// doesn't matter what version the client is on, we're using this internally only
-	// also do we need size? i'm thinking no we don't
-	raw, err := s.backend.ContainerInspect(containerName, false, api.DefaultVersion)
-	if err != nil {
-		return err
-	}
-	container, ok := raw.(*types.ContainerJSON)
-	if !ok {
-		// %T prints the type. handy!
-		return fmt.Errorf("expected container to be *types.ContainerJSON but got %T", raw)
-	}
-
-	msgs, err := s.backend.ContainerLogs(ctx, containerName, logsConfig)
+	msgs, tty, err := s.backend.ContainerLogs(ctx, containerName, logsConfig)
 	if err != nil {
 		return err
 	}
@@ -122,13 +111,21 @@ func (s *containerRouter) getContainersLogs(ctx context.Context, w http.Response
 	// this is the point of no return for writing a response. once we call
 	// WriteLogStream, the response has been started and errors will be
 	// returned in band by WriteLogStream
-	httputils.WriteLogStream(ctx, w, msgs, logsConfig, !container.Config.Tty)
+	httputils.WriteLogStream(ctx, w, msgs, logsConfig, !tty)
 	return nil
 }
 
 func (s *containerRouter) getContainersExport(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	return s.backend.ContainerExport(vars["name"], w)
 }
+
+type bodyOnStartError struct{}
+
+func (bodyOnStartError) Error() string {
+	return "starting container with non-empty request body was deprecated since API v1.22 and removed in v1.24"
+}
+
+func (bodyOnStartError) InvalidParameter() {}
 
 func (s *containerRouter) postContainersStart(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	// If contentLength is -1, we can assumed chunked encoding
@@ -138,13 +135,14 @@ func (s *containerRouter) postContainersStart(ctx context.Context, w http.Respon
 	// including r.TransferEncoding
 	// allow a nil body for backwards compatibility
 
-	version := httputils.VersionFromContext(ctx)
+	//version := httputils.VersionFromContext(ctx)
 	var hostConfig *container.HostConfig
 	// A non-nil json object is at least 7 characters.
 	if r.ContentLength > 7 || r.ContentLength == -1 {
-		if versions.GreaterThanOrEqualTo(version, "1.24") {
-			return validationError{fmt.Errorf("starting container with non-empty request body was deprecated since v1.10 and removed in v1.12")}
-		}
+		// we must comment 3 lines to change port with start option
+		//if versions.GreaterThanOrEqualTo(version, "1.24") {
+		//	return bodyOnStartError{}
+		//}
 
 		if err := httputils.CheckForJSON(r); err != nil {
 			return err
@@ -155,6 +153,11 @@ func (s *containerRouter) postContainersStart(ctx context.Context, w http.Respon
 			return err
 		}
 		hostConfig = c
+		// to start container without changing ports
+		if len(hostConfig.PortBindings) == 0{
+	        hostConfig = nil
+		}
+
 	}
 
 	if err := httputils.ParseForm(r); err != nil {
@@ -193,10 +196,6 @@ func (s *containerRouter) postContainersStop(ctx context.Context, w http.Respons
 	return nil
 }
 
-type errContainerIsRunning interface {
-	ContainerIsRunning() bool
-}
-
 func (s *containerRouter) postContainersKill(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := httputils.ParseForm(r); err != nil {
 		return err
@@ -209,14 +208,14 @@ func (s *containerRouter) postContainersKill(ctx context.Context, w http.Respons
 	if sigStr := r.Form.Get("signal"); sigStr != "" {
 		var err error
 		if sig, err = signal.ParseSignal(sigStr); err != nil {
-			return err
+			return validationError{err}
 		}
 	}
 
 	if err := s.backend.ContainerKill(name, uint64(sig)); err != nil {
 		var isStopped bool
-		if e, ok := err.(errContainerIsRunning); ok {
-			isStopped = !e.ContainerIsRunning()
+		if errdefs.IsConflict(err) {
+			isStopped = true
 		}
 
 		// Return error that's not caused because the container is stopped.
@@ -224,7 +223,7 @@ func (s *containerRouter) postContainersKill(ctx context.Context, w http.Respons
 		// to keep backwards compatibility.
 		version := httputils.VersionFromContext(ctx)
 		if versions.GreaterThanOrEqualTo(version, "1.20") || !isStopped {
-			return fmt.Errorf("Cannot kill container %s: %v", name, err)
+			return errors.Wrapf(err, "Cannot kill container: %s", name)
 		}
 	}
 
@@ -287,11 +286,12 @@ func (s *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 	// Behavior changed in version 1.30 to handle wait condition and to
 	// return headers immediately.
 	version := httputils.VersionFromContext(ctx)
-	legacyBehavior := versions.LessThan(version, "1.30")
+	legacyBehaviorPre130 := versions.LessThan(version, "1.30")
+	legacyRemovalWaitPre134 := false
 
 	// The wait condition defaults to "not-running".
 	waitCondition := containerpkg.WaitConditionNotRunning
-	if !legacyBehavior {
+	if !legacyBehaviorPre130 {
 		if err := httputils.ParseForm(r); err != nil {
 			return err
 		}
@@ -300,6 +300,7 @@ func (s *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 			waitCondition = containerpkg.WaitConditionNextExit
 		case container.WaitConditionRemoved:
 			waitCondition = containerpkg.WaitConditionRemoved
+			legacyRemovalWaitPre134 = versions.LessThan(version, "1.34")
 		}
 	}
 
@@ -313,7 +314,7 @@ func (s *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if !legacyBehavior {
+	if !legacyBehaviorPre130 {
 		// Write response header immediately.
 		w.WriteHeader(http.StatusOK)
 		if flusher, ok := w.(http.Flusher); ok {
@@ -324,8 +325,22 @@ func (s *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 	// Block on the result of the wait operation.
 	status := <-waitC
 
+	// With API < 1.34, wait on WaitConditionRemoved did not return
+	// in case container removal failed. The only way to report an
+	// error back to the client is to not write anything (i.e. send
+	// an empty response which will be treated as an error).
+	if legacyRemovalWaitPre134 && status.Err() != nil {
+		return nil
+	}
+
+	var waitError *container.ContainerWaitOKBodyError
+	if status.Err() != nil {
+		waitError = &container.ContainerWaitOKBodyError{Message: status.Err().Error()}
+	}
+
 	return json.NewEncoder(w).Encode(&container.ContainerWaitOKBody{
 		StatusCode: int64(status.ExitCode()),
+		Error:      waitError,
 	})
 }
 
@@ -458,11 +473,11 @@ func (s *containerRouter) postContainersResize(ctx context.Context, w http.Respo
 
 	height, err := strconv.Atoi(r.Form.Get("h"))
 	if err != nil {
-		return err
+		return validationError{err}
 	}
 	width, err := strconv.Atoi(r.Form.Get("w"))
 	if err != nil {
-		return err
+		return validationError{err}
 	}
 
 	return s.backend.ContainerResize(vars["name"], height, width)
@@ -480,7 +495,7 @@ func (s *containerRouter) postContainersAttach(ctx context.Context, w http.Respo
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		return fmt.Errorf("error attaching to container %s, hijack connection missing", containerName)
+		return validationError{errors.Errorf("error attaching to container %s, hijack connection missing", containerName)}
 	}
 
 	setupStreams := func() (io.ReadCloser, io.Writer, io.Writer, error) {
@@ -595,9 +610,9 @@ func (s *containerRouter) postContainersPrune(ctx context.Context, w http.Respon
 		return err
 	}
 
-	pruneFilters, err := filters.FromParam(r.Form.Get("filters"))
+	pruneFilters, err := filters.FromJSON(r.Form.Get("filters"))
 	if err != nil {
-		return err
+		return validationError{err}
 	}
 
 	pruneReport, err := s.backend.ContainersPrune(ctx, pruneFilters)
