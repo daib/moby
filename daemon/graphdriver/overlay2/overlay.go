@@ -292,7 +292,7 @@ func (d *Driver) Status() [][2]string {
 // GetMetadata returns meta data about the overlay driver such as
 // LowerDir, UpperDir, WorkDir and MergeDir used to store data.
 func (d *Driver) GetMetadata(id string) (map[string]string, error) {
-	dir := d.dir(id)
+	dir := d.read_dir(id)
 	if _, err := os.Stat(dir); err != nil {
 		return nil, err
 	}
@@ -324,6 +324,8 @@ func (d *Driver) Cleanup() error {
 // CreateReadWrite creates a layer that is writable for use as a container
 // file system.
 func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts) error {
+	opts.StorageOpt = nil
+
 	if opts != nil && len(opts.StorageOpt) != 0 && !projectQuotaSupported {
 		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
 	}
@@ -356,7 +358,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 }
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
-	dir := d.dir(id)
+	dir := d.read_dir(id)
 
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
 	if err != nil {
@@ -395,7 +397,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	}
 
 	lid := generateID(idLength)
-	if err := os.Symlink(path.Join("..", id, "diff"), path.Join(d.home, linkDir, lid)); err != nil {
+	if err := os.Symlink(path.Join(dir, "diff"), path.Join(d.home, linkDir, lid)); err != nil {
 		return err
 	}
 
@@ -451,7 +453,9 @@ func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) e
 
 func (d *Driver) getLower(parent string) (string, error) {
 	parentDir := d.dir(parent)
-
+	if strings.Contains(parent, "init") {
+		parentDir = d.read_dir(parent)
+	}
 	// Ensure parent exists
 	if _, err := os.Lstat(parentDir); err != nil {
 		return "", err
@@ -479,9 +483,35 @@ func (d *Driver) dir(id string) string {
 	return path.Join(d.home, id)
 }
 
+// separate string which has path and mount-id
+func SeparateIdPath(raw string) map[string]string{
+	// check variable check if $ is in raw, actually if create called from CreateReadWrite or Create
+	check := 0
+	IdPathMap := make(map[string]string)
+	for i:=0; i<len(raw); i++{
+		if string(raw[i]) == "$"{
+			check = 1
+			IdPathMap["ContainerPath"] = string(raw[0:i])
+			IdPathMap["Id"] = string(raw[i+1:len(raw)])
+		}
+	}
+	if check == 0{
+		IdPathMap["Id"] = raw
+	}
+	return IdPathMap
+}
+// read_dir will extract folder have 2 upper layer from /var/lib/docker/containers/container-id/startPath
+func (d *Driver) read_dir(rawid string) string {
+	IdPathMap := SeparateIdPath(rawid)
+	if len(IdPathMap["ContainerPath"]) != 0 {
+		return path.Join(IdPathMap["ContainerPath"], IdPathMap["Id"])
+	}
+	return d.dir(IdPathMap["Id"])
+}
+
 func (d *Driver) getLowerDirs(id string) ([]string, error) {
 	var lowersArray []string
-	lowers, err := ioutil.ReadFile(path.Join(d.dir(id), lowerFile))
+	lowers, err := ioutil.ReadFile(path.Join(d.read_dir(id), lowerFile))
 	if err == nil {
 		for _, s := range strings.Split(string(lowers), ":") {
 			lp, err := os.Readlink(path.Join(d.home, s))
@@ -500,7 +530,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 func (d *Driver) Remove(id string) error {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
-	dir := d.dir(id)
+	dir := d.read_dir(id)
 	lid, err := ioutil.ReadFile(path.Join(dir, "link"))
 	if err == nil {
 		if err := os.RemoveAll(path.Join(d.home, linkDir, string(lid))); err != nil {
@@ -518,7 +548,7 @@ func (d *Driver) Remove(id string) error {
 func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr error) {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
-	dir := d.dir(id)
+	dir := d.read_dir(id)
 	if _, err := os.Stat(dir); err != nil {
 		return nil, err
 	}
@@ -608,7 +638,7 @@ func (d *Driver) Get(id, mountLabel string) (_ containerfs.ContainerFS, retErr e
 func (d *Driver) Put(id string) error {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
-	dir := d.dir(id)
+	dir := d.read_dir(id)
 	_, err := ioutil.ReadFile(path.Join(dir, lowerFile))
 	if err != nil {
 		// If no lower, no mount happened and just return directly
@@ -638,6 +668,7 @@ func (d *Driver) Exists(id string) bool {
 func (d *Driver) isParent(id, parent string) bool {
 	lowers, err := d.getLowerDirs(id)
 	if err != nil {
+		logrus.Debugf("isParent going to return because error != nil")
 		return false
 	}
 	if parent == "" && len(lowers) > 0 {
